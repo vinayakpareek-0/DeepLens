@@ -14,6 +14,7 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_community.tools import WikipediaQueryRun, ArxivQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
 
 load_dotenv()
 
@@ -136,18 +137,110 @@ worker_builder.add_edge("call_tools", "summarize_findings")
 worker_builder.add_edge("summarize_findings", END)
 worker_graph = worker_builder.compile()
 
+# State — Main Graph
+
+
+class AgentState(TypedDict):
+    """State for the main research agent graph."""
+
+    query: str
+    plan: list  # list of SubTopic dicts
+    worker_results: Annotated[list[dict], operator.add]
+    report: dict  # ResearchReport as dict
+    feedback: str
+
+
+# Main Graph — Nodes
+
+
+def plan_research(state: AgentState) -> dict:
+    """LLM decomposes the user query into 2-4 parallel sub-topics."""
+    planner = llm.with_structured_output(ResearchPlan)
+    plan = planner.invoke(
+        f"Decompose this research query into 2-4 focused sub-topics. "
+        f"For each, specify a search query and which tools to use "
+        f"(tavily_search for web, wikipedia for encyclopedic, arxiv for academic).\n\n"
+        f"Query: {state['query']}"
+    )
+    return {"plan": [t.model_dump() for t in plan.sub_topics]}
+
+
+def fan_out_research(state: AgentState) -> list[Send]:
+    """Fan out: dispatch one worker per sub-topic using Send API."""
+    return [
+        Send("research_worker", {
+            "topic": topic["title"],
+            "search_query": topic["search_query"],
+            "tools_to_use": topic["tools"],
+            "findings": [],
+            "summary": "",
+        })
+        for topic in state["plan"]
+    ]
+
+
+def collect_worker_result(state: WorkerState) -> dict:
+    """Bridge: worker subgraph output → main graph's worker_results list."""
+    return {
+        "worker_results": [{
+            "topic": state["topic"],
+            "summary": state["summary"],
+            "findings": state["findings"],
+        }]
+    }
+
+
+# Main Graph — Build & Compile (partial — synthesis + HITL in next step)
+
+
+def build_research_worker() -> StateGraph:
+    """Build the research worker subgraph (tool calls + summarize)."""
+    builder = StateGraph(WorkerState)
+    builder.add_node("call_tools", call_tools)
+    builder.add_node("summarize_findings", summarize_findings)
+    builder.add_node("collect_result", collect_worker_result)
+    builder.add_edge(START, "call_tools")
+    builder.add_edge("call_tools", "summarize_findings")
+    builder.add_edge("summarize_findings", "collect_result")
+    builder.add_edge("collect_result", END)
+    return builder.compile()
+
+
+def build_graph():
+    """Build the main research agent graph."""
+    builder = StateGraph(AgentState)
+
+    # Nodes
+    builder.add_node("plan_research", plan_research)
+    builder.add_node("research_worker", build_research_worker())
+
+    # Edges
+    builder.add_edge(START, "plan_research")
+    builder.add_conditional_edges("plan_research", fan_out_research)
+    builder.add_edge("research_worker", END)  # temporary — synthesis added next step
+
+    return builder.compile()
+
+
+graph = build_graph()
+
 
 # Smoke Test
 
 if __name__ == "__main__":
-    print("Testing Worker Subgraph...")
-    result = worker_graph.invoke({
-        "topic": "Quantum Computing Advances",
-        "search_query": "quantum computing breakthroughs 2025",
-        "tools_to_use": ["tavily_search", "wikipedia"],
-        "findings": [],
-    })
-    print(f"Topic: {result['topic']}")
-    print(f"Tools called: {len(result['findings'])} sources")
-    print(f"\nSummary:\n{result['summary'][:500]}...")
-    print("\n✓ Worker subgraph operational.")
+    import json
+
+    print("Testing full graph: plan + parallel research...\n")
+    result = graph.invoke({"query": "What are the latest advances in quantum computing?"})
+
+    print(f"Query: {result['query']}")
+    print(f"Sub-topics planned: {len(result['plan'])}")
+    for topic in result["plan"]:
+        print(f"  • {topic['title']} → tools: {topic['tools']}")
+
+    print(f"\nWorker results collected: {len(result['worker_results'])}")
+    for wr in result["worker_results"]:
+        print(f"\n--- {wr['topic']} ---")
+        print(f"{wr['summary'][:300]}...")
+
+    print("\n✓ Plan + Map-Reduce operational.")
