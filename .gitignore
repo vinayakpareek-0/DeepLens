@@ -31,3 +31,6 @@ checkpoints.db
 
 # Reports
 reports/
+
+# Antigravity
+implementation_plan.md
