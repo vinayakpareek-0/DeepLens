@@ -4,7 +4,8 @@ Built with LangGraph | Multi-tool parallel research with human-in-the-loop
 """
 
 import os
-from typing import Literal
+import operator
+from typing import Annotated, Literal, TypedDict
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -12,6 +13,7 @@ from langchain_groq import ChatGroq
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_community.tools import WikipediaQueryRun, ArxivQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
+from langgraph.graph import StateGraph, START, END
 
 load_dotenv()
 
@@ -82,26 +84,70 @@ class ResearchReport(BaseModel):
     sources: list[Source] = Field(description="All sources cited")
 
 
+# State — Worker Subgraph
+
+
+class WorkerState(TypedDict):
+    """State for an individual research worker."""
+
+    topic: str
+    search_query: str
+    tools_to_use: list[str]
+    findings: Annotated[list[str], operator.add]
+    summary: str
+
+
+# Worker Subgraph — Nodes
+
+
+def call_tools(state: WorkerState) -> dict:
+    """Call each specified tool with the search query."""
+    results = []
+    for tool_name in state["tools_to_use"]:
+        tool = tool_map.get(tool_name)
+        if not tool:
+            continue
+        try:
+            result = tool.invoke(state["search_query"])
+            results.append(f"[{tool_name}]:\n{result}")
+        except Exception as e:
+            results.append(f"[{tool_name}]: Error — {e}")
+    return {"findings": results}
+
+
+def summarize_findings(state: WorkerState) -> dict:
+    """LLM summarizes raw tool findings into a concise brief."""
+    findings_text = "\n\n".join(state["findings"])
+    response = llm.invoke(
+        f"Research topic: {state['topic']}\n\n"
+        f"Raw findings:\n{findings_text}\n\n"
+        f"Write a concise research brief (3-5 paragraphs) with key facts and insights."
+    )
+    return {"summary": response.content}
+
+
+# Worker Subgraph — Build & Compile
+
+worker_builder = StateGraph(WorkerState)
+worker_builder.add_node("call_tools", call_tools)
+worker_builder.add_node("summarize_findings", summarize_findings)
+worker_builder.add_edge(START, "call_tools")
+worker_builder.add_edge("call_tools", "summarize_findings")
+worker_builder.add_edge("summarize_findings", END)
+worker_graph = worker_builder.compile()
+
+
 # Smoke Test
 
 if __name__ == "__main__":
-    # Test LLM connection
-    print("Testing LLM...")
-    response = llm.invoke("Say 'DeepLens is online' in one sentence.")
-    print(f"LLM: {response.content}\n")
-
-    # Test structured output
-    print("Testing structured output (ResearchPlan)...")
-    planner = llm.with_structured_output(ResearchPlan)
-    plan = planner.invoke("What are the latest advances in quantum computing?")
-    print(f"Plan: {plan.model_dump_json(indent=2)}\n")
-
-    # Test tools
-    print("Testing Tavily...")
-    print(tavily_search.invoke("latest quantum computing breakthroughs 2025")[:200])
-    print("\nTesting Wikipedia...")
-    print(wikipedia.invoke("Quantum computing")[:200])
-    print("\nTesting ArXiv...")
-    print(arxiv.invoke("quantum computing")[:200])
-
-    print("\n✓ All systems operational.")
+    print("Testing Worker Subgraph...")
+    result = worker_graph.invoke({
+        "topic": "Quantum Computing Advances",
+        "search_query": "quantum computing breakthroughs 2025",
+        "tools_to_use": ["tavily_search", "wikipedia"],
+        "findings": [],
+    })
+    print(f"Topic: {result['topic']}")
+    print(f"Tools called: {len(result['findings'])} sources")
+    print(f"\nSummary:\n{result['summary'][:500]}...")
+    print("\n✓ Worker subgraph operational.")
