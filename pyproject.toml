@@ -1,0 +1,17 @@
+[project]
+name = "deeplens"
+version = "0.1.0"
+description = "Autonomous multi-tool research agent built with LangGraph"
+requires-python = ">=3.12"
+dependencies = [
+    "langgraph>=0.4",
+    "langchain>=0.3",
+    "langchain-groq>=0.3",
+    "langchain-community>=0.3",
+    "tavily-python>=0.5",
+    "wikipedia>=1.4",
+    "arxiv>=2.1",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "langsmith>=0.3",
+]

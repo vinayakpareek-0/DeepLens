@@ -26,8 +26,10 @@ env/
 Thumbs.db
 
 # LangGraph
+.langgraph_api/
 checkpoints.db
 *.sqlite
+
 
 # Reports
 reports/

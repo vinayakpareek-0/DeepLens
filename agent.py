@@ -233,10 +233,10 @@ def build_graph(checkpointer=None, store=None):
     builder.add_node("human_review", human_review)
     builder.add_node("save_report", save_report)
     builder.add_edge(START, "plan_research")
-    builder.add_conditional_edges("plan_research", fan_out_research)
+    builder.add_conditional_edges("plan_research", fan_out_research, ["research_worker"])
     builder.add_edge("research_worker", "synthesize_report")
     builder.add_edge("synthesize_report", "human_review")
-    builder.add_conditional_edges("human_review", should_continue_review)
+    builder.add_conditional_edges("human_review", should_continue_review, ["save_report", "human_review"])
     builder.add_edge("save_report", END)
     return builder.compile(checkpointer=checkpointer, store=store)
 
