@@ -207,7 +207,7 @@ def save_report(state: AgentState, *, store) -> dict:
         state["query"][:50],
         {"query": state["query"], "report": state["report"]},
     )
-    return {}
+    return {"feedback": "saved", "report": state["report"]}
 
 
 # --- Graph Assembly ---
