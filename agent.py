@@ -16,6 +16,7 @@ from langchain_community.tools import WikipediaQueryRun, ArxivQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send, interrupt
+from langgraph.store.memory import InMemoryStore
 
 load_dotenv()
 
@@ -198,9 +199,15 @@ def should_continue_review(state: AgentState) -> str:
         return "save_report"
     return "human_review"
 
-def save_report(state: AgentState) -> dict:
-    """Save the final approved report."""
-    print("\nReport approved and saved.")
+def save_report(state: AgentState, *, store) -> dict:
+    """Save the final approved report to long-term memory store."""
+    report = state["report"]
+    # Save to cross-thread store for future recall
+    store.put(
+        ("research",),
+        state["query"][:50],
+        {"query": state["query"], "report": report},
+    )
     return {}
 
 
@@ -217,7 +224,7 @@ def build_research_worker():
     builder.add_edge("collect_result", END)
     return builder.compile()
 
-def build_graph(checkpointer=None):
+def build_graph(checkpointer=None, store=None):
     """Build the main research agent graph."""
     builder = StateGraph(AgentState)
     builder.add_node("plan_research", plan_research)
@@ -233,44 +240,118 @@ def build_graph(checkpointer=None):
     builder.add_conditional_edges("human_review", should_continue_review)
     builder.add_edge("save_report", END)
 
-    return builder.compile(checkpointer=checkpointer)
+    return builder.compile(checkpointer=checkpointer, store=store)
 
+# Module-level graph (for langgraph.json deployment — platform provides checkpointer/store)
 graph = build_graph()
 
 
-# Smoke Test
+# Interactive CLI
 if __name__ == "__main__":
-    from langgraph.checkpoint.memory import InMemorySaver
+    import uuid
+    from langgraph.checkpoint.memory import MemorySaver
     from langgraph.types import Command
-    memory = InMemorySaver()
 
-    test_graph = build_graph(checkpointer=memory)
-    config = {"configurable": {"thread_id": "test-1"}}
+    memory = MemorySaver()
+    store = InMemoryStore()
+    app = build_graph(checkpointer=memory, store=store)
 
-    print("Running DeepLens...\n")
+    def run_research(query: str):
+        """Run a research query with streaming and human-in-the-loop."""
+        thread_id = str(uuid.uuid4())[:8]
+        config = {"configurable": {"thread_id": thread_id}}
+        print(f"\n[thread: {thread_id}]")
+        print(f"Researching: {query}\n")
 
-    # First run — pauses at human_review interrupt
-    for event in test_graph.stream(
-        {"query": "What are the latest advances in quantum computing?"},
-        config=config,
-    ):
-        for node in event:
-            if node != "__interrupt__":
-                print(f"[{node}] done")
+        # Stream until interrupt
+        for event in app.stream({"query": query}, config=config):
+            for node in event:
+                if node != "__interrupt__":
+                    print(f"  [{node}] done")
 
-    # Show report preview
-    state = test_graph.get_state(config)
-    report = state.values.get("report", {})
-    print(f"\nReport: {report.get('title', 'N/A')}")
-    print(f"Sections: {len(report.get('sections', []))}")
-    print(f"Sources: {len(report.get('sources', []))}")
+        # Show report
+        state = app.get_state(config)
+        report = state.values.get("report", {})
+        print(f"\n{'='*60}")
+        print(f"Title: {report.get('title', 'N/A')}")
+        print(f"Summary: {report.get('summary', 'N/A')}")
+        for section in report.get("sections", []):
+            print(f"\n## {section['heading']}")
+            print(section["content"])
+        print(f"\nSources: {len(report.get('sources', []))}")
+        for src in report.get("sources", []):
+            print(f"  - {src['title']} {src.get('url', '')}")
+        print(f"{'='*60}")
 
-    # Resume with approval
-    print("\nApproving report...")
-    for event in test_graph.stream(Command(resume="approve"), config=config):
-        for node in event:
-            if node != "__interrupt__":
-                print(f"[{node}] done")
+        # Human review loop
+        while True:
+            feedback = input("\n> Approve (yes) or provide edit instructions: ").strip()
+            if not feedback:
+                continue
+            if feedback.lower() in ("yes", "y", "approve"):
+                for event in app.stream(Command(resume="approve"), config=config):
+                    for node in event:
+                        if node != "__interrupt__":
+                            print(f"  [{node}] done")
+                print("Report saved to memory.")
+                break
+            else:
+                for event in app.stream(Command(resume=feedback), config=config):
+                    for node in event:
+                        if node != "__interrupt__":
+                            print(f"  [{node}] done")
+                # Show revised report
+                state = app.get_state(config)
+                report = state.values.get("report", {})
+                print(f"\nRevised: {report.get('title', 'N/A')}")
+                print(f"Summary: {report.get('summary', 'N/A')}")
 
-    print("\nDone.")
+    def show_history():
+        """Show past research from long-term memory store."""
+        items = store.search(("research",))
+        if not items:
+            print("No past research found.")
+            return
+        print(f"\nPast research ({len(items)} items):")
+        for item in items:
+            data = item.value
+            print(f"  - {data['report'].get('title', data['query'])}")
 
+    def show_time_travel(thread_id: str):
+        """Show state history for a thread (time travel)."""
+        config = {"configurable": {"thread_id": thread_id}}
+        history = list(app.get_state_history(config))
+        if not history:
+            print("No history found for this thread.")
+            return
+        print(f"\nState history ({len(history)} checkpoints):")
+        for i, state in enumerate(history):
+            node = state.next[0] if state.next else "END"
+            print(f"  [{i}] next={node} checkpoint={state.config['configurable']['checkpoint_id'][:8]}")
+
+    # CLI loop
+    print("DeepLens Research Agent")
+    print("Commands: /history  /travel <thread_id>  /quit")
+    print("-" * 40)
+
+    while True:
+        try:
+            user_input = input("\nQuery: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            break
+        if not user_input:
+            continue
+        if user_input == "/quit":
+            break
+        elif user_input == "/history":
+            show_history()
+        elif user_input.startswith("/travel"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) > 1:
+                show_time_travel(parts[1])
+            else:
+                print("Usage: /travel <thread_id>")
+        else:
+            run_research(user_input)
+
+    print("Goodbye.")
