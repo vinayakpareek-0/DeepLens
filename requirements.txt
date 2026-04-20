@@ -1,0 +1,17 @@
+# LangGraph & LangChain
+langgraph>=0.4
+langchain>=0.3
+langchain-openai>=0.3
+langchain-community>=0.3
+
+# Tools
+tavily-python>=0.5
+wikipedia>=1.4
+arxiv>=2.1
+
+# Validation & Config
+pydantic>=2.0
+python-dotenv>=1.0
+
+# LangSmith (tracing)
+langsmith>=0.3
