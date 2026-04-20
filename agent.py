@@ -5,6 +5,7 @@ Built with LangGraph | Multi-tool parallel research with human-in-the-loop
 
 import os
 import json
+import uuid
 import operator
 from typing import Annotated, Literal, TypedDict
 
@@ -20,26 +21,27 @@ from langgraph.store.memory import InMemoryStore
 
 load_dotenv()
 
-# LLM
+
+# --- LLM & Tools ---
+
 llm = ChatGroq(
     model=os.getenv("MODEL_NAME", "llama-3.3-70b-versatile"),
     temperature=0,
 )
 
-# Tools
 tavily_search = TavilySearchResults(max_results=3, name="tavily_search")
-
 wikipedia = WikipediaQueryRun(
     api_wrapper=WikipediaAPIWrapper(top_k_results=2, doc_content_chars_max=2000),
     name="wikipedia",
 )
-
 arxiv = ArxivQueryRun(name="arxiv")
+
 tools = [tavily_search, wikipedia, arxiv]
 tool_map = {tool.name: tool for tool in tools}
 
 
-# Pydantic Schemas
+# --- Pydantic Schemas ---
+
 class SubTopic(BaseModel):
     """A single research sub-topic."""
     title: str = Field(description="Short title for this sub-topic")
@@ -73,9 +75,10 @@ class ResearchReport(BaseModel):
     sources: list[Source] = Field(description="All sources cited")
 
 
-# State Schemas
+# --- State Schemas ---
+
 class WorkerState(TypedDict):
-    """State for an individual research worker."""
+    """State for an individual research worker (subgraph)."""
     topic: str
     search_query: str
     tools_to_use: list[str]
@@ -91,9 +94,10 @@ class AgentState(TypedDict):
     feedback: str
 
 
-# Worker Subgraph — Nodes
+# --- Worker Subgraph Nodes ---
+
 def call_tools(state: WorkerState) -> dict:
-    """Call each specified tool with the search query."""
+    """Call each tool specified for this sub-topic."""
     results = []
     for tool_name in state["tools_to_use"]:
         tool = tool_map.get(tool_name)
@@ -107,7 +111,7 @@ def call_tools(state: WorkerState) -> dict:
     return {"findings": results}
 
 def summarize_findings(state: WorkerState) -> dict:
-    """LLM summarizes raw tool findings into a concise brief."""
+    """LLM summarizes raw tool output into a research brief."""
     findings_text = "\n\n".join(state["findings"])
     response = llm.invoke(
         f"Research topic: {state['topic']}\n\n"
@@ -117,7 +121,7 @@ def summarize_findings(state: WorkerState) -> dict:
     return {"summary": response.content}
 
 def collect_worker_result(state: WorkerState) -> dict:
-    """Bridge: worker output -> main graph's worker_results list."""
+    """Bridge: pack worker output into parent graph's worker_results list."""
     return {"worker_results": [{
         "topic": state["topic"],
         "summary": state["summary"],
@@ -125,9 +129,10 @@ def collect_worker_result(state: WorkerState) -> dict:
     }]}
 
 
-# Main Graph — Nodes
+# --- Main Graph Nodes ---
+
 def plan_research(state: AgentState) -> dict:
-    """LLM decomposes the user query into 2-4 parallel sub-topics."""
+    """LLM decomposes user query into 2-4 parallel sub-topics."""
     planner = llm.with_structured_output(ResearchPlan)
     plan = planner.invoke(
         f"Decompose this research query into 2-4 focused sub-topics. "
@@ -138,7 +143,7 @@ def plan_research(state: AgentState) -> dict:
     return {"plan": [t.model_dump() for t in plan.sub_topics]}
 
 def fan_out_research(state: AgentState) -> list[Send]:
-    """Fan out: dispatch one worker per sub-topic via Send API."""
+    """Map: dispatch one worker per sub-topic via Send API."""
     return [
         Send("research_worker", {
             "topic": t["title"],
@@ -157,63 +162,58 @@ def synthesize_report(state: AgentState) -> dict:
     )
     synthesizer = llm.with_structured_output(ResearchReport)
     report = synthesizer.invoke(
-        f"You are a research report writer. Synthesize these research findings "
-        f"into a well-structured report with a title, executive summary, "
-        f"detailed sections, and source citations.\n\n"
+        f"Synthesize these research findings into a structured report "
+        f"with title, executive summary, detailed sections, and sources.\n\n"
         f"Original query: {state['query']}\n\n"
         f"Research findings:\n{results_text}"
     )
     return {"report": report.model_dump()}
 
 def human_review(state: AgentState) -> dict:
-    """Pause for human review. User can approve or request edits."""
+    """Pause execution for human approval or edit instructions."""
     report = state["report"]
-    print("\n" + "=" * 60)
-    print("REPORT READY FOR REVIEW")
-    print("=" * 60)
-    print(f"\nTitle: {report['title']}")
-    print(f"Summary: {report['summary']}")
-    print(f"Sections: {len(report['sections'])}")
-    print(f"Sources: {len(report['sources'])}")
-    print("\n" + "=" * 60)
-
-    feedback = interrupt(
-        "Review the report above. Reply 'approve' to save, or provide edit instructions."
-    )
-
-    if feedback.lower().strip() == "approve":
+    feedback = interrupt({
+        "type": "review",
+        "title": report["title"],
+        "summary": report["summary"],
+        "sections": len(report["sections"]),
+        "sources": len(report["sources"]),
+        "message": "Reply 'approve' to save, or provide edit instructions.",
+    })
+    if feedback.lower().strip() in ("approve", "yes", "y"):
         return {"feedback": "approved"}
-
-    # Re-synthesize with feedback
+    # Include original research data for better revision
+    results_context = "\n".join(
+        f"- {wr['topic']}: {wr['summary'][:200]}" for wr in state.get("worker_results", [])
+    )
     synthesizer = llm.with_structured_output(ResearchReport)
     revised = synthesizer.invoke(
-        f"Revise this research report based on feedback.\n\n"
+        f"Revise this research report based on user feedback. "
+        f"Use the original research data to add more detail.\n\n"
         f"Current report:\n{json.dumps(report, indent=2)}\n\n"
-        f"Feedback: {feedback}"
+        f"Original research data:\n{results_context}\n\n"
+        f"User feedback: {feedback}"
     )
     return {"report": revised.model_dump(), "feedback": feedback}
 
 def should_continue_review(state: AgentState) -> str:
-    """Route: if approved go to save, otherwise loop back for review."""
-    if state.get("feedback") == "approved":
-        return "save_report"
-    return "human_review"
+    """Route: approved -> save, otherwise -> review again."""
+    return "save_report" if state.get("feedback") == "approved" else "human_review"
 
 def save_report(state: AgentState, *, store) -> dict:
-    """Save the final approved report to long-term memory store."""
-    report = state["report"]
-    # Save to cross-thread store for future recall
+    """Save approved report to long-term memory store."""
     store.put(
         ("research",),
         state["query"][:50],
-        {"query": state["query"], "report": report},
+        {"query": state["query"], "report": state["report"]},
     )
     return {}
 
 
-# Graph Assembly
-def build_research_worker():
-    """Build the research worker subgraph."""
+# --- Graph Assembly ---
+
+def build_worker_subgraph():
+    """Build the research worker subgraph: call_tools -> summarize -> collect."""
     builder = StateGraph(WorkerState)
     builder.add_node("call_tools", call_tools)
     builder.add_node("summarize_findings", summarize_findings)
@@ -228,27 +228,25 @@ def build_graph(checkpointer=None, store=None):
     """Build the main research agent graph."""
     builder = StateGraph(AgentState)
     builder.add_node("plan_research", plan_research)
-    builder.add_node("research_worker", build_research_worker())
+    builder.add_node("research_worker", build_worker_subgraph())
     builder.add_node("synthesize_report", synthesize_report)
     builder.add_node("human_review", human_review)
     builder.add_node("save_report", save_report)
-
     builder.add_edge(START, "plan_research")
     builder.add_conditional_edges("plan_research", fan_out_research)
     builder.add_edge("research_worker", "synthesize_report")
     builder.add_edge("synthesize_report", "human_review")
     builder.add_conditional_edges("human_review", should_continue_review)
     builder.add_edge("save_report", END)
-
     return builder.compile(checkpointer=checkpointer, store=store)
 
-# Module-level graph (for langgraph.json deployment — platform provides checkpointer/store)
+# Exported graph for langgraph.json (platform provides checkpointer/store)
 graph = build_graph()
 
 
-# Interactive CLI
+# --- Interactive CLI ---
+
 if __name__ == "__main__":
-    import uuid
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.types import Command
 
@@ -256,36 +254,34 @@ if __name__ == "__main__":
     store = InMemoryStore()
     app = build_graph(checkpointer=memory, store=store)
 
-    def run_research(query: str):
-        """Run a research query with streaming and human-in-the-loop."""
+    def run_query(query: str):
         thread_id = str(uuid.uuid4())[:8]
         config = {"configurable": {"thread_id": thread_id}}
-        print(f"\n[thread: {thread_id}]")
-        print(f"Researching: {query}\n")
+        print(f"\n[thread:{thread_id}] Researching: {query}\n")
 
-        # Stream until interrupt
+        # Run graph — pauses at human_review
         for event in app.stream({"query": query}, config=config):
             for node in event:
                 if node != "__interrupt__":
                     print(f"  [{node}] done")
 
-        # Show report
+        # Display report
         state = app.get_state(config)
         report = state.values.get("report", {})
-        print(f"\n{'='*60}")
+        print(f"\n{'='*50}")
         print(f"Title: {report.get('title', 'N/A')}")
         print(f"Summary: {report.get('summary', 'N/A')}")
-        for section in report.get("sections", []):
-            print(f"\n## {section['heading']}")
-            print(section["content"])
-        print(f"\nSources: {len(report.get('sources', []))}")
+        for s in report.get("sections", []):
+            print(f"\n## {s['heading']}")
+            print(s["content"])
+        print(f"\nSources ({len(report.get('sources', []))}):")
         for src in report.get("sources", []):
             print(f"  - {src['title']} {src.get('url', '')}")
-        print(f"{'='*60}")
+        print(f"{'='*50}")
 
         # Human review loop
         while True:
-            feedback = input("\n> Approve (yes) or provide edit instructions: ").strip()
+            feedback = input("\nApprove? (yes / edit instructions): ").strip()
             if not feedback:
                 continue
             if feedback.lower() in ("yes", "y", "approve"):
@@ -293,45 +289,46 @@ if __name__ == "__main__":
                     for node in event:
                         if node != "__interrupt__":
                             print(f"  [{node}] done")
-                print("Report saved to memory.")
+                print("Report saved.")
                 break
             else:
                 for event in app.stream(Command(resume=feedback), config=config):
                     for node in event:
                         if node != "__interrupt__":
                             print(f"  [{node}] done")
-                # Show revised report
                 state = app.get_state(config)
                 report = state.values.get("report", {})
-                print(f"\nRevised: {report.get('title', 'N/A')}")
+                print(f"\n{'='*50}")
+                print(f"Revised: {report.get('title', 'N/A')}")
                 print(f"Summary: {report.get('summary', 'N/A')}")
+                for s in report.get("sections", []):
+                    print(f"\n## {s['heading']}")
+                    print(s["content"])
+                print(f"{'='*50}")
 
     def show_history():
-        """Show past research from long-term memory store."""
         items = store.search(("research",))
         if not items:
-            print("No past research found.")
+            print("No past research.")
             return
-        print(f"\nPast research ({len(items)} items):")
+        print(f"\nPast research ({len(items)}):")
         for item in items:
-            data = item.value
-            print(f"  - {data['report'].get('title', data['query'])}")
+            print(f"  - {item.value['report'].get('title', item.value['query'])}")
 
-    def show_time_travel(thread_id: str):
-        """Show state history for a thread (time travel)."""
-        config = {"configurable": {"thread_id": thread_id}}
+    def show_time_travel(tid):
+        config = {"configurable": {"thread_id": tid}}
         history = list(app.get_state_history(config))
         if not history:
-            print("No history found for this thread.")
+            print("No history for this thread.")
             return
-        print(f"\nState history ({len(history)} checkpoints):")
-        for i, state in enumerate(history):
-            node = state.next[0] if state.next else "END"
-            print(f"  [{i}] next={node} checkpoint={state.config['configurable']['checkpoint_id'][:8]}")
+        print(f"\nCheckpoints ({len(history)}):")
+        for i, s in enumerate(history):
+            nxt = s.next[0] if s.next else "END"
+            print(f"  [{i}] next={nxt} id={s.config['configurable']['checkpoint_id'][:8]}")
 
-    # CLI loop
+    # Main loop
     print("DeepLens Research Agent")
-    print("Commands: /history  /travel <thread_id>  /quit")
+    print("Commands: /history | /travel <thread_id> | /quit")
     print("-" * 40)
 
     while True:
@@ -347,11 +344,8 @@ if __name__ == "__main__":
             show_history()
         elif user_input.startswith("/travel"):
             parts = user_input.split(maxsplit=1)
-            if len(parts) > 1:
-                show_time_travel(parts[1])
-            else:
-                print("Usage: /travel <thread_id>")
+            show_time_travel(parts[1]) if len(parts) > 1 else print("Usage: /travel <thread_id>")
         else:
-            run_research(user_input)
+            run_query(user_input)
 
     print("Goodbye.")
